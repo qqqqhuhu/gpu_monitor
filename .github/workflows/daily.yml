@@ -9,7 +9,13 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     permissions:
-      contents: write       # 允许 workflow 推送 commit
+      contents: write
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - uses: actions/checkout@v4
@@ -36,3 +42,15 @@ jobs:
 
       - name: Push
         run: git push
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
