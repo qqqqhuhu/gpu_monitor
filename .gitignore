@@ -5,8 +5,5 @@ __pycache__/
 .venv/
 venv/
 
-# 生成产物(本地看看就好,不入库)
-dashboard.html
-
 # macOS
 .DS_Store

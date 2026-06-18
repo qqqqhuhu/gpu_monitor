@@ -1,0 +1,40 @@
+<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPU租赁价格看板</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#09090f;color:#e2e2ee;font-family:'IBM Plex Sans',sans-serif;padding:20px;font-size:13px}
+h1{font-family:'IBM Plex Mono',monospace;font-size:16px;margin-bottom:4px}
+.sub{color:#6060a0;font-family:'IBM Plex Mono',monospace;font-size:11px;margin-bottom:20px}
+.card{background:#111118;border:1px solid rgba(255,255,255,0.06);border-radius:6px;padding:18px;margin-bottom:12px}
+.ct{font-family:'IBM Plex Mono',monospace;font-size:10px;color:#6060a0;text-transform:uppercase;letter-spacing:.5px;margin-bottom:14px}
+</style></head><body>
+<h1>GPU 租赁价格看板</h1>
+<div class="sub">数据源: Vast.ai 现货市场 · 每卡每小时中位价</div>
+<div class="card"><div class="ct">现货中位价趋势 ($/GPU/小时)</div>
+<div style="position:relative;height:340px"><canvas id="price"></canvas></div></div>
+<div class="card"><div class="ct">可租GPU供给量(供给↑+价格↓ = 去库存拐点信号)</div>
+<div style="position:relative;height:300px"><canvas id="supply"></canvas></div></div>
+<script>
+const dates=["2026-06-18"];
+const priceData={"H100": [2.0022], "H200": [3.3339], "B200": [4.3771], "A100": [0.8007]};
+const supplyData={"H100": [126.0], "H200": [147.0], "B200": [168.0]};
+const colors={H100:'#f5a623',H200:'#00e5a0',B200:'#ff4466',A100:'#4488ff'};
+const gc='rgba(255,255,255,0.05)',tc='#6060a0';
+new Chart(document.getElementById('price'),{type:'line',
+ data:{labels:dates,datasets:Object.keys(priceData).map(g=>({label:g,data:priceData[g],
+   borderColor:colors[g],backgroundColor:'transparent',borderWidth:2,pointRadius:0,tension:.3,spanGaps:true}))},
+ options:{responsive:true,maintainAspectRatio:false,
+   plugins:{legend:{labels:{color:tc,font:{family:'IBM Plex Mono',size:10},boxWidth:10}}},
+   scales:{x:{ticks:{color:tc,font:{size:9},maxTicksLimit:12},grid:{color:gc}},
+     y:{ticks:{color:tc,font:{size:10},callback:v=>'$'+v},grid:{color:gc}}}}});
+new Chart(document.getElementById('supply'),{type:'line',
+ data:{labels:dates,datasets:Object.keys(supplyData).map(g=>({label:g,data:supplyData[g],
+   borderColor:colors[g],backgroundColor:'transparent',borderWidth:2,pointRadius:0,tension:.3,spanGaps:true}))},
+ options:{responsive:true,maintainAspectRatio:false,
+   plugins:{legend:{labels:{color:tc,font:{family:'IBM Plex Mono',size:10},boxWidth:10}}},
+   scales:{x:{ticks:{color:tc,font:{size:9},maxTicksLimit:12},grid:{color:gc}},
+     y:{ticks:{color:tc,font:{size:10}},grid:{color:gc}}}}});
+</script></body></html>
