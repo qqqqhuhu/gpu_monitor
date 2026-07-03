@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 
 # ── 配置 ────────────────────────────────────────────────
 # Vast.ai 公开 bundles 端点,无需 API key
-VAST_API = "https://console.vast.ai/api/v0/bundles/"
+VAST_API = "https://cloud.vast.ai/api/v0/bundles/"
 
 # 要监测的 GPU 型号(Vast.ai 的命名)
 TARGET_GPUS = ["H100", "H200", "B200", "RTX 4090", "A100"]
@@ -54,8 +54,12 @@ def fetch_offers():
     resp = requests.get(VAST_API, params=params, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     data = resp.json()
-    return data.get("offers", [])
-
+    offers = data.get("offers", [])
+    if not offers:
+        # 空结果时打印响应内容,方便排查是接口变了还是真的没挂单
+        print(f"  ⚠ 警告: offers为空! 响应keys: {list(data.keys())}")
+        print(f"  响应片段: {json.dumps(data)[:300]}")
+    return offers
 
 def summarize(offers):
     """
