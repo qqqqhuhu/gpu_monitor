@@ -28,6 +28,8 @@ jobs:
         run: pip install requests
 
       - name: Fetch GPU prices
+        env:
+          VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
         run: python fetch_vast.py
 
       - name: Generate dashboard

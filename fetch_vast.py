@@ -1,170 +1,214 @@
-"""
-GPU租赁价格监测器 — Vast.ai 数据抓取模块
-=========================================
-抓取 Vast.ai 公开市场的 GPU 现货挂单,提取价格与供需信号。
+"""Fetch and aggregate Vast.ai GPU offers into ``data/gpu_prices.csv``."""
 
-核心思路(对应投资框架):
-  - 不只记录价格,还记录"利用率代理",因为:
-      价格跌 + 利用率高 = 良性(供给增加,需求消化得了) → 补库存合理
-      价格跌 + 利用率低 = 恶性(需求退潮,GPU闲置)     → 滑向去库存
-  - 记录价格离散度(中位数 vs 最低价),反映市场结构
-
-依赖: requests  (pip install requests)
-用法: python fetch_vast.py
-输出: 追加一行到 data/gpu_prices.csv
-"""
-
-import requests
 import csv
-import json
 import os
+import re
 import statistics
+import sys
+import tempfile
 from datetime import datetime, timezone
 
-# ── 配置 ────────────────────────────────────────────────
-# Vast.ai 公开 bundles 端点,无需 API key
-VAST_API = "https://cloud.vast.ai/api/v0/bundles/"
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# 要监测的 GPU 型号(Vast.ai 的命名)
+
+VAST_API = "https://console.vast.ai/api/v0/bundles/"
 TARGET_GPUS = ["H100", "H200", "B200", "RTX 4090", "A100"]
+REQUIRED_GPUS = ["H100", "H200", "B200", "A100"]
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 CSV_PATH = os.path.join(DATA_DIR, "gpu_prices.csv")
 
-# 请求头,模拟正常浏览器,降低被拦概率
-HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-}
+
+class FetchError(RuntimeError):
+    """The response is not safe to append to the historical dataset."""
 
 
-def fetch_offers():
-    """
-    拉取 Vast.ai 当前所有可租 GPU 挂单。
-    返回原始 offers 列表;失败抛异常由上层处理。
-    """
-    # Vast 支持用查询参数过滤,这里只取可租(rentable)的实例
-    params = {"q": json.dumps({
+def _session():
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("POST",),
+        respect_retry_after_header=True,
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+def fetch_offers(api_key=None, session=None):
+    """Return the complete authenticated on-demand offer search response."""
+    api_key = api_key or os.environ.get("VAST_API_KEY")
+    if not api_key:
+        raise FetchError("VAST_API_KEY is not set; refusing Vast.ai's unauthenticated fallback data")
+
+    payload = {
         "rentable": {"eq": True},
         "rented": {"eq": False},
-        "order": [["dph_total", "asc"]],   # 按总价升序
+        "type": "ondemand",
+        "order": [["dph_total", "asc"]],
         "limit": 5000,
-    })}
-    resp = requests.get(VAST_API, params=params, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    offers = data.get("offers", [])
+    }
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "qqqqhuhu-gpu-monitor/2.0",
+    }
+    client = session or _session()
+    response = client.post(VAST_API, json=payload, headers=headers, timeout=30)
+    print(f"HTTP status: {response.status_code}")
+    if response.status_code >= 400:
+        snippet = response.text.replace("\n", " ")[:300]
+        raise FetchError(f"Vast.ai HTTP {response.status_code}: {snippet}")
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise FetchError("Vast.ai returned invalid JSON") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("offers"), list):
+        keys = list(data) if isinstance(data, dict) else type(data).__name__
+        raise FetchError(f"unexpected Vast.ai response shape; keys/type={keys}")
+
+    offers = data["offers"]
+    print(f"Returned records: {len(offers)}")
     if not offers:
-        # 空结果时打印响应内容,方便排查是接口变了还是真的没挂单
-        print(f"  ⚠ 警告: offers为空! 响应keys: {list(data.keys())}")
-        print(f"  响应片段: {json.dumps(data)[:300]}")
+        raise FetchError("Vast.ai returned zero offers")
     return offers
 
+
+def classify_gpu_name(name):
+    """Map current Vast.ai model variants to stable dashboard series names."""
+    normalized = re.sub(r"[^A-Z0-9]+", " ", str(name).upper()).strip()
+    compact = normalized.replace(" ", "")
+    # Check exact generations independently so H100 PCIe/SXM/NVL all map to H100.
+    for model in ("B200", "H200", "H100", "A100"):
+        if re.search(rf"(?:^| ){model}(?: |$)", normalized) or model in compact:
+            return model
+    if "RTX4090" in compact:
+        return "RTX 4090"
+    return None
+
+
 def summarize(offers):
-    """
-    把原始挂单聚合成每个型号的信号指标。
-    返回 dict: { 'H100': {price_median, price_min, count, ...}, ... }
-    """
+    grouped = {gpu: [] for gpu in TARGET_GPUS}
+    for offer in offers:
+        if not isinstance(offer, dict):
+            continue
+        gpu = classify_gpu_name(offer.get("gpu_name", ""))
+        if gpu:
+            grouped[gpu].append(offer)
+
     result = {}
     for gpu in TARGET_GPUS:
-        # 匹配该型号的挂单(gpu_name 字段做模糊包含匹配)
-        matched = [
-            o for o in offers
-            if gpu.replace(" ", "").lower() in o.get("gpu_name", "").replace(" ", "").lower()
-        ]
-        if not matched:
-            result[gpu] = None
-            continue
-
-        # 关键: 计算"每卡每小时"价格 = 总价 / GPU数量
-        # dph_total 是整个实例的时价, num_gpus 是卡数
-        per_gpu_prices = []
+        matched = grouped[gpu]
+        prices = []
         total_gpus = 0
-        for o in matched:
-            n = o.get("num_gpus", 1) or 1
-            dph = o.get("dph_total")
-            if dph and n:
-                per_gpu_prices.append(dph / n)
-                total_gpus += n
+        invalid = 0
+        for offer in matched:
+            try:
+                count = int(offer.get("num_gpus"))
+                total_price = float(offer.get("dph_total"))
+                if count <= 0 or total_price <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                invalid += 1
+                continue
+            prices.append(total_price / count)
+            total_gpus += count
 
-        if not per_gpu_prices:
+        print(f"{gpu} matches: {len(matched)} (valid={len(prices)}, invalid={invalid})")
+        if not prices:
             result[gpu] = None
+            print(f"{gpu} median: n/a; supply: 0")
             continue
 
-        per_gpu_prices.sort()
+        prices.sort()
+        median = statistics.median(prices)
         result[gpu] = {
-            "price_median": round(statistics.median(per_gpu_prices), 4),
-            "price_min": round(min(per_gpu_prices), 4),
-            "price_p25": round(per_gpu_prices[len(per_gpu_prices) // 4], 4),
-            # 离散度: 中位数/最低价, 越大说明市场分化越严重(可能有人在甩卖)
-            "price_dispersion": round(statistics.median(per_gpu_prices) / min(per_gpu_prices), 3),
-            # 供给代理: 当前可租的该型号实例数 与 总GPU数
-            "offer_count": len(matched),
+            "price_median": round(median, 4),
+            "price_min": round(prices[0], 4),
+            "price_p25": round(prices[len(prices) // 4], 4),
+            "price_dispersion": round(median / prices[0], 3),
+            "offer_count": len(prices),
             "available_gpus": total_gpus,
         }
+        print(f"{gpu} median: ${median:.4f}/GPU/hour; supply: {total_gpus} GPUs")
     return result
 
 
-def append_csv(summary):
-    """把本次结果追加为 CSV 的一行(宽表: 每个型号几列)。"""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def validate_summary(summary):
+    missing = [gpu for gpu in REQUIRED_GPUS if not summary.get(gpu)]
+    if missing:
+        raise FetchError(
+            "no valid priced offers for required GPU series: " + ", ".join(missing)
+        )
 
-    # 构造表头与行
+
+def _csv_header():
     header = ["date"]
-    row = [today]
     for gpu in TARGET_GPUS:
         key = gpu.replace(" ", "")
-        header += [f"{key}_median", f"{key}_min", f"{key}_dispersion",
-                   f"{key}_offers", f"{key}_gpus"]
-        s = summary.get(gpu)
-        if s:
-            row += [s["price_median"], s["price_min"], s["price_dispersion"],
-                    s["offer_count"], s["available_gpus"]]
+        header += [
+            f"{key}_median", f"{key}_min", f"{key}_dispersion",
+            f"{key}_offers", f"{key}_gpus",
+        ]
+    return header
+
+
+def append_csv(summary, csv_path=CSV_PATH, today=None):
+    """Atomically replace today's row only after the full summary is valid."""
+    validate_summary(summary)
+    today = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    header = _csv_header()
+    row = [today]
+    for gpu in TARGET_GPUS:
+        item = summary.get(gpu)
+        if item:
+            row += [item["price_median"], item["price_min"], item["price_dispersion"],
+                    item["offer_count"], item["available_gpus"]]
         else:
             row += ["", "", "", "", ""]
 
-    file_exists = os.path.exists(CSV_PATH)
-    # 防重复: 如果今天已经写过,先读出来去重(简单实现: 跳过同日期)
-    if file_exists:
-        with open(CSV_PATH, newline="") as f:
-            existing = [r for r in csv.reader(f)]
-        existing = [r for r in existing if r and r[0] != today]  # 去掉今天的旧记录
-        with open(CSV_PATH, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(header)
-            w.writerows(existing[1:] if existing and existing[0][0] == "date" else existing)
-            w.writerow(row)
-    else:
-        with open(CSV_PATH, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(header)
-            w.writerow(row)
+    existing_rows = []
+    if os.path.exists(csv_path):
+        with open(csv_path, newline="", encoding="utf-8") as handle:
+            current = list(csv.reader(handle))
+        if current and current[0] != header:
+            raise FetchError("existing CSV header does not match the current schema")
+        existing_rows = [r for r in current[1:] if r and r[0] != today]
+
+    directory = os.path.dirname(csv_path)
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix="gpu_prices.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(header)
+            writer.writerows(existing_rows)
+            writer.writerow(row)
+        os.replace(temp_path, csv_path)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise
 
 
 def main():
-    print(f"[{datetime.now(timezone.utc).isoformat()}] 开始抓取 Vast.ai ...")
+    print(f"[{datetime.now(timezone.utc).isoformat()}] Fetching Vast.ai offers")
     try:
         offers = fetch_offers()
-        print(f"  ✓ 拿到 {len(offers)} 条挂单")
-    except Exception as e:
-        print(f"  ✗ 抓取失败: {e}")
-        print("  → 保留历史数据,本次跳过(不写入空行)")
+        summary = summarize(offers)
+        validate_summary(summary)
+        append_csv(summary)
+    except (FetchError, requests.RequestException, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print("Historical data preserved; no CSV row was written.", file=sys.stderr)
         return 1
 
-    summary = summarize(offers)
-    print("\n  各型号信号:")
-    for gpu, s in summary.items():
-        if s:
-            print(f"    {gpu:10s}  中位 ${s['price_median']:.3f}/h  "
-                  f"最低 ${s['price_min']:.3f}  离散 {s['price_dispersion']:.2f}  "
-                  f"挂单 {s['offer_count']}  可租GPU {s['available_gpus']}")
-        else:
-            print(f"    {gpu:10s}  (无挂单)")
-
-    append_csv(summary)
-    print(f"\n  ✓ 已写入 {CSV_PATH}")
+    print(f"Wrote validated snapshot to {CSV_PATH}")
     return 0
 
 
